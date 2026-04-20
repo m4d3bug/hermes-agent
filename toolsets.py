@@ -52,8 +52,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
-    # Code execution + delegation
-    "execute_code", "delegate_task",
+    # Code execution + delegation + orchestration
+    "execute_code", "delegate_task", "orchestrate",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -189,6 +189,12 @@ TOOLSETS = {
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
+        "includes": []
+    },
+
+    "orchestration": {
+        "description": "Multi-agent orchestration with task decomposition, role assignment, and DAG execution",
+        "tools": ["orchestrate"],
         "includes": []
     },
 

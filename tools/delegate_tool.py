@@ -31,6 +31,7 @@ from toolsets import TOOLSETS
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset([
     "delegate_task",   # no recursive delegation
+    "orchestrate",     # no recursive orchestration from subagents
     "clarify",         # no user interaction
     "memory",          # no writes to shared MEMORY.md
     "send_message",    # no cross-platform side effects
@@ -50,7 +51,19 @@ _SUBAGENT_TOOLSETS = sorted(
 _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
-MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+_DEFAULT_MAX_DEPTH = 3  # parent(0) -> child(1) -> grandchild(2) -> rejected at 3
+
+
+def _get_max_depth() -> int:
+    """Read delegation.max_depth from config, default 3."""
+    cfg = _load_config()
+    val = cfg.get("max_depth")
+    if val is not None:
+        try:
+            return max(1, int(val))
+        except (TypeError, ValueError):
+            pass
+    return _DEFAULT_MAX_DEPTH
 
 
 def _get_max_concurrent_children() -> int:
@@ -92,13 +105,17 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    role_prompt: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent."""
-    parts = [
-        "You are a focused subagent working on a specific delegated task.",
-        "",
-        f"YOUR TASK:\n{goal}",
-    ]
+    if role_prompt:
+        parts = [role_prompt, "", f"YOUR TASK:\n{goal}"]
+    else:
+        parts = [
+            "You are a focused subagent working on a specific delegated task.",
+            "",
+            f"YOUR TASK:\n{goal}",
+        ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -279,6 +296,8 @@ def _build_child_agent(
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Specialized agent role
+    role: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -318,8 +337,22 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
+    # Resolve role-specific system prompt and default toolsets
+    role_prompt = None
+    if role:
+        from tools.agent_roles import get_role
+        role_def = get_role(role)
+        if role_def:
+            role_prompt = role_def["system_prompt"]
+            if not toolsets:
+                toolsets = role_def.get("default_toolsets")
+        else:
+            logger.warning("Unknown agent role '%s', using generic prompt", role)
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
-    child_prompt = _build_child_system_prompt(goal, context, workspace_path=workspace_hint)
+    child_prompt = _build_child_system_prompt(
+        goal, context, workspace_path=workspace_hint, role_prompt=role_prompt,
+    )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -685,6 +718,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
+    role: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -701,10 +735,11 @@ def delegate_task(
 
     # Depth limit
     depth = getattr(parent_agent, '_delegate_depth', 0)
-    if depth >= MAX_DEPTH:
+    max_depth = _get_max_depth()
+    if depth >= max_depth:
         return json.dumps({
             "error": (
-                f"Delegation depth limit reached ({MAX_DEPTH}). "
+                f"Delegation depth limit reached ({max_depth}). "
                 "Subagents cannot spawn further subagents."
             )
         })
@@ -737,7 +772,7 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
+        task_list = [{"goal": goal, "context": context, "toolsets": toolsets, "role": role}]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -777,6 +812,7 @@ def delegate_task(
                 override_api_mode=creds["api_mode"],
                 override_acp_command=t.get("acp_command") or acp_command,
                 override_acp_args=t.get("acp_args") or acp_args,
+                role=t.get("role") or role,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -1096,6 +1132,16 @@ DELEGATE_TASK_SCHEMA = {
                     "conversation history."
                 ),
             },
+            "role": {
+                "type": "string",
+                "description": (
+                    "Specialized agent role. When set, the subagent gets a "
+                    "role-specific system prompt and default toolsets. "
+                    "Built-in roles: researcher, coder, reviewer, planner, "
+                    "debugger, browser_agent, sysadmin. Custom roles can be "
+                    "defined in ~/.hermes/agent_roles.yaml."
+                ),
+            },
             "context": {
                 "type": "string",
                 "description": (
@@ -1122,6 +1168,7 @@ DELEGATE_TASK_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "goal": {"type": "string", "description": "Task goal"},
+                        "role": {"type": "string", "description": "Agent role for this task (researcher, coder, reviewer, planner, debugger, browser_agent, sysadmin)"},
                         "context": {"type": "string", "description": "Task-specific context"},
                         "toolsets": {
                             "type": "array",
@@ -1194,6 +1241,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
+        role=args.get("role"),
         parent_agent=kw.get("parent_agent")),
     check_fn=check_delegate_requirements,
     emoji="🔀",

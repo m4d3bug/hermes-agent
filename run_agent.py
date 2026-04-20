@@ -8283,6 +8283,16 @@ class AIAgent:
                 toolsets=function_args.get("toolsets"),
                 tasks=function_args.get("tasks"),
                 max_iterations=function_args.get("max_iterations"),
+                role=function_args.get("role"),
+                parent_agent=self,
+            )
+        elif function_name == "orchestrate":
+            from tools.orchestrator_tool import orchestrate as _orchestrate
+            return _orchestrate(
+                task=function_args.get("task", ""),
+                hints=function_args.get("hints"),
+                max_subtasks=function_args.get("max_subtasks"),
+                max_iterations_per_task=function_args.get("max_iterations_per_task"),
                 parent_agent=self,
             )
         else:
@@ -8821,6 +8831,7 @@ class AIAgent:
                         toolsets=function_args.get("toolsets"),
                         tasks=tasks_arg,
                         max_iterations=function_args.get("max_iterations"),
+                        role=function_args.get("role"),
                         parent_agent=self,
                     )
                     _delegate_result = function_result
@@ -8828,6 +8839,34 @@ class AIAgent:
                     self._delegate_spinner = None
                     tool_duration = time.time() - tool_start_time
                     cute_msg = _get_cute_tool_message_impl('delegate_task', function_args, tool_duration, result=_delegate_result)
+                    if spinner:
+                        spinner.stop(cute_msg)
+                    elif self._should_emit_quiet_tool_messages():
+                        self._vprint(f"  {cute_msg}")
+            elif function_name == "orchestrate":
+                from tools.orchestrator_tool import orchestrate as _orchestrate
+                task_preview = (function_args.get("task") or "")[:30]
+                spinner_label = f"🎭 orchestrating: {task_preview}" if task_preview else "🎭 orchestrating"
+                spinner = None
+                if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
+                    face = random.choice(KawaiiSpinner.get_waiting_faces())
+                    spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
+                    spinner.start()
+                self._delegate_spinner = spinner
+                _orch_result = None
+                try:
+                    function_result = _orchestrate(
+                        task=function_args.get("task", ""),
+                        hints=function_args.get("hints"),
+                        max_subtasks=function_args.get("max_subtasks"),
+                        max_iterations_per_task=function_args.get("max_iterations_per_task"),
+                        parent_agent=self,
+                    )
+                    _orch_result = function_result
+                finally:
+                    self._delegate_spinner = None
+                    tool_duration = time.time() - tool_start_time
+                    cute_msg = _get_cute_tool_message_impl('orchestrate', function_args, tool_duration, result=_orch_result)
                     if spinner:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():

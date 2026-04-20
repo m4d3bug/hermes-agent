@@ -60,6 +60,29 @@ Return ONLY a valid JSON object (no markdown, no explanation) with this schema:
 """
 
 
+def _call_parent_llm(parent_agent, messages: list, temperature: float = 0.3, max_tokens: int = 4096) -> str:
+    """Call the LLM using the parent agent's own client and model config.
+
+    This avoids the auxiliary task routing path entirely — the orchestrator
+    uses exactly the same provider/model the parent agent is running on.
+    Works with any backend: Ollama, OpenRouter, Anthropic, custom endpoints.
+    """
+    from openai import OpenAI
+
+    base_url = getattr(parent_agent, "base_url", None)
+    api_key = getattr(parent_agent, "api_key", None) or "no-key"
+    model = getattr(parent_agent, "model", None) or "default"
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content.strip()
+
+
 def _decompose_task(
     task_description: str,
     parent_agent,
@@ -67,8 +90,6 @@ def _decompose_task(
     max_subtasks: int = MAX_SUBTASKS,
 ) -> Dict[str, Any]:
     """Use LLM to decompose a complex task into subtasks with role assignments."""
-    from agent.auxiliary_client import call_llm
-
     hints_block = f"\nHINTS:\n{hints}\n" if hints else ""
     prompt = _DECOMPOSITION_PROMPT.format(
         task=task_description,
@@ -76,25 +97,7 @@ def _decompose_task(
         max_subtasks=max_subtasks,
     )
 
-    main_runtime = None
-    if parent_agent:
-        main_runtime = {
-            "provider": getattr(parent_agent, "provider", None),
-            "base_url": getattr(parent_agent, "base_url", None),
-            "api_key": getattr(parent_agent, "api_key", None),
-            "api_mode": getattr(parent_agent, "api_mode", None),
-            "model": getattr(parent_agent, "model", None),
-        }
-
-    response = call_llm(
-        task="compression",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=4096,
-        main_runtime=main_runtime,
-    )
-
-    content = response.choices[0].message.content.strip()
+    content = _call_parent_llm(parent_agent, [{"role": "user", "content": prompt}])
     if content.startswith("```"):
         lines = content.split("\n")
         lines = [l for l in lines if not l.startswith("```")]
@@ -227,8 +230,6 @@ def _synthesize_results(
     parent_agent,
 ) -> str:
     """Use LLM to synthesize all subtask results into a final response."""
-    from agent.auxiliary_client import call_llm
-
     parts = [f"ORIGINAL TASK:\n{original_task}\n"]
     for task_id, result in subtask_results.items():
         summary = result.get("summary", "") or result.get("error", "No output")
@@ -236,25 +237,7 @@ def _synthesize_results(
         parts.append(f"=== {task_id} (status: {status}) ===\n{summary}\n")
     parts.append(f"\nINSTRUCTIONS:\n{synthesis_prompt}")
 
-    main_runtime = None
-    if parent_agent:
-        main_runtime = {
-            "provider": getattr(parent_agent, "provider", None),
-            "base_url": getattr(parent_agent, "base_url", None),
-            "api_key": getattr(parent_agent, "api_key", None),
-            "api_mode": getattr(parent_agent, "api_mode", None),
-            "model": getattr(parent_agent, "model", None),
-        }
-
-    response = call_llm(
-        task="compression",
-        messages=[{"role": "user", "content": "\n".join(parts)}],
-        temperature=0.3,
-        max_tokens=4096,
-        main_runtime=main_runtime,
-    )
-
-    return response.choices[0].message.content.strip()
+    return _call_parent_llm(parent_agent, [{"role": "user", "content": "\n".join(parts)}])
 
 
 def orchestrate(
